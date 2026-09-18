@@ -1,0 +1,5 @@
+mcp>=1.0.0
+mcp-types>=1.0.0
+ib-insync>=0.9.90
+starlette>=0.37.0
+uvicorn>=0.29.0
