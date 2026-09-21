@@ -7,6 +7,8 @@ import os
 import json
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Optional
 
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -80,7 +82,14 @@ def _run_ib_sync(fn, *args, **kwargs):
         if loop is not None:
             loop.close()
 
-def get_ib(client_id: int = 1) -> IB:
+_client_counter = [1]
+_client_lock = threading.Lock()
+
+def get_ib(client_id: Optional[int] = None) -> IB:
+    if client_id is None:
+        with _client_lock:
+            client_id = _client_counter[0]
+            _client_counter[0] += 1
     ib = IB()
     ib.connect(HOST, PORT, clientId=client_id, timeout=10)
     return ib
@@ -450,6 +459,46 @@ mcp_app = server.streamable_http_app(
 
 # Las rutas del MCP server se injectan en el mismo Starlette app
 mcp_app.add_route("/health", route=health, methods=["GET"])
+
+
+# ── REST endpoints (para dashboard externo) ──────────────────────────────────
+
+def _ib_status():
+    """Sincrono para usar con add_route."""
+    return ib_get_status()
+
+def _ib_account():
+    return ib_get_account()
+
+def _ib_positions():
+    return ib_get_positions()
+
+from starlette.responses import JSONResponse
+
+async def rest_status(request: Request) -> JSONResponse:
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, _run_ib_sync, _ib_status)
+        return JSONResponse({**result, "time": datetime.now().isoformat()})
+    except Exception as e:
+        return JSONResponse({"connected": False, "error": str(e)}, status_code=503)
+
+async def rest_account(request: Request) -> JSONResponse:
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, _run_ib_sync, _ib_account)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+async def rest_positions(request: Request) -> JSONResponse:
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, _run_ib_sync, _ib_positions)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+mcp_app.add_route("/api/status", route=rest_status, methods=["GET"])
+mcp_app.add_route("/api/account", route=rest_account, methods=["GET"])
+mcp_app.add_route("/api/positions", route=rest_positions, methods=["GET"])
 
 app = mcp_app
 
