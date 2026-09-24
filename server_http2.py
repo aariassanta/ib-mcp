@@ -440,6 +440,458 @@ def ib_get_option_prices(symbol: str, expiry: str, right: str = "", ATM_delta: i
     return {"spot": spot_used, "atm_strike": atm_strike, "options": result}
 
 
+def ib_get_metrics_underlying(symbol: str, exchange: str = "SMART") -> dict:
+    """Métricas del subyacente: spot, spread, HV (vol histórica), 52w high/low.
+
+    Vol implícita (IV) viene por ``get_option_prices`` / ``get_metrics_chain``.
+    Aquí se calcula ``HV`` (Close-to-Close log-returns) sobre 20 y 50 días
+    usando ``reqHistoricalData``. Útil para IV Rank cuando se compara contra HV.
+
+    Args:
+        symbol: ticker o índice (SPY, NVDA, SPX, ...).
+        exchange: defaults SMART; CBOE para índices.
+    """
+    import math
+    from ib_insync import Stock, Index
+
+    ib = get_ib()
+    sym = symbol.upper()
+    INDEXES = {"SPX", "NDX", "VIX", "RUT", "SPXW", "NDXW"}
+    if sym in INDEXES:
+        base = Index(sym, "CBOE", "USD")
+    else:
+        base = Stock(sym, exchange, "USD")
+    ib.qualifyContracts(base)
+    if not base.conId:
+        return {"error": f"No se pudo resolver contrato para {sym}"}
+
+    # 1) Snapshot spot / bid / ask
+    ticker = ib.reqMktData(base, "", False)
+    for _ in range(20):
+        if ticker.bid is not None and not _is_nan(ticker.bid):
+            break
+        ib.sleep(0.1)
+    bid = _clean(ticker.bid)
+    ask = _clean(ticker.ask)
+    last = _clean(ticker.last)
+    close = _clean(ticker.close)
+    spot = ticker.marketPrice() if ticker.marketPrice() == ticker.marketPrice() else None
+    if not spot or spot != spot:
+        spot = last or close
+    try:
+        ib.cancelMktData(base)
+    except Exception:
+        pass
+
+    bid_ask_spread = round((ask - bid), 4) if (bid is not None and ask is not None) else None
+    spread_pct = round((bid_ask_spread / spot) * 100, 3) if (spot and bid_ask_spread is not None) else None
+
+    # 2) Histórico 1 año para HV + 52w high/low
+    bars = []
+    try:
+        bars = ib.reqHistoricalData(base, '', '1 Y', '1 day', 'TRADES', False)
+    except Exception as e:
+        return {
+            "symbol": sym,
+            "spot": spot, "bid": bid, "ask": ask, "last": last,
+            "spread": bid_ask_spread, "spread_pct": spread_pct,
+            "error": f"historical data failed: {e}",
+        }
+
+    closes = [b.close for b in bars if b.close == b.close]  # filtra NaN
+    if len(closes) < 21:
+        return {
+            "symbol": sym, "spot": spot, "bid": bid, "ask": ask, "last": last,
+            "spread": bid_ask_spread, "spread_pct": spread_pct,
+            "bars_count": len(closes),
+            "warning": "pocos históricos para HV — <21 barras",
+        }
+
+    def hv(window):
+        if len(closes) < window + 1:
+            return None
+        recent = closes[-window - 1:]
+        rets = [math.log(recent[i] / recent[i - 1]) for i in range(1, len(recent))]
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        return round(math.sqrt(var) * math.sqrt(252) * 100, 2)  # anualizada, %
+
+    hv20 = hv(20)
+    hv50 = hv(50)
+
+    hi_52w = round(max(closes), 2)
+    lo_52w = round(min(closes), 2)
+    last_close = round(closes[-1], 2) if closes else None
+    pct_off_high = round(((last_close - hi_52w) / hi_52w) * 100, 2) if last_close else None
+    pct_off_low = round(((last_close - lo_52w) / lo_52w) * 100, 2) if last_close else None
+
+    return {
+        "symbol": sym,
+        "spot": round(spot, 2) if spot else None,
+        "bid": bid, "ask": ask, "last": last,
+        "spread": bid_ask_spread,
+        "spread_pct": spread_pct,  # % del spot
+        "hv20_pct": hv20,          # vol histórica 20d anualizada
+        "hv50_pct": hv50,          # vol histórica 50d anualizada
+        "close_52w_high": hi_52w,
+        "close_52w_low": lo_52w,
+        "last_close": last_close,
+        "pct_off_52w_high": pct_off_high,
+        "pct_off_52w_low": pct_off_low,
+        "bars_used": len(closes),
+    }
+
+
+def ib_get_metrics_spread(symbol: str, expiry: str, right: str,
+                          short_strike: float, long_strike: float) -> dict:
+    """Métricas de un spread 2-leg (PCS o CCS) ya colocado: credit, max loss,
+    breakeven, IV/delta agregados, spread% de cada leg.
+
+    Args:
+        symbol: subyacente (SPX, SPY, NVDA, ...).
+        expiry: YYYYMMDD.
+        right: 'P' (put credit spread) o 'C' (call credit spread).
+        short_strike: strike vendido (más cercano al spot).
+        long_strike: strike comprado (protección, más lejos del spot).
+    """
+    ib = get_ib()
+    sym = symbol.upper()
+    r = right.upper()
+    if r not in ("C", "P"):
+        return {"error": "right debe ser 'C' o 'P'"}
+
+    INDEXES = {"SPX", "NDX", "VIX", "RUT", "SPXW", "NDXW"}
+    if sym in INDEXES:
+        base = Index(sym, "CBOE", "USD")
+        opt_exchange = "CBOE"
+    else:
+        base = Stock(sym, "SMART", "USD")
+        opt_exchange = "SMART"
+    ib.qualifyContracts(base)
+    if not base.conId:
+        return {"error": f"No se pudo resolver contrato para {sym}"}
+
+    # Trading class del chain
+    chains = ib.reqSecDefOptParams(base.symbol, '', base.secType, base.conId)
+    trading_class = None
+    for chain in chains:
+        if expiry in chain.expirations:
+            trading_class = chain.tradingClass
+            break
+
+    def make_leg(strike):
+        c = Contract()
+        c.symbol = sym
+        c.secType = 'OPT'
+        c.currency = 'USD'
+        c.exchange = opt_exchange
+        c.lastTradeDateOrContractMonth = expiry
+        c.strike = strike
+        c.right = r
+        c.tradingClass = trading_class or sym
+        c.multiplier = '100'
+        return c
+
+    short_c = make_leg(short_strike)
+    long_c = make_leg(long_strike)
+    ib.qualifyContracts(short_c, long_c)
+    if not short_c.conId or not long_c.conId:
+        return {"error": "no se pudo resolver conId para los strikes dados"}
+
+    short_t = ib.reqMktData(short_c, "101,106,236", False, False)
+    long_t = ib.reqMktData(long_c, "101,106,236", False, False)
+    for _ in range(30):
+        ready = (short_t.bid is not None and short_t.bid == short_t.bid and
+                 long_t.bid is not None and long_t.bid == long_t.bid)
+        if ready:
+            break
+        ib.sleep(0.2)
+
+    def leg_data(c, t):
+        bid = _clean(t.bid)
+        ask = _clean(t.ask)
+        last = _clean(t.last)
+        mid = round((bid + ask) / 2, 2) if (bid is not None and ask is not None) else None
+        spread = round((ask - bid), 2) if (bid is not None and ask is not None) else None
+        oi = None
+        if c.right == 'C' and hasattr(t, 'callOpenInterest'):
+            oi = t.callOpenInterest
+        elif c.right == 'P' and hasattr(t, 'putOpenInterest'):
+            oi = t.putOpenInterest
+        greeks = t.modelGreeks if (hasattr(t, 'modelGreeks') and t.modelGreeks) else None
+        return {
+            "strike": c.strike,
+            "conId": c.conId,
+            "bid": bid, "ask": ask, "last": last, "mid": mid,
+            "spread": spread,
+            "spread_pct": round((spread / mid) * 100, 2) if (spread and mid) else None,
+            "volume": int(t.volume) if t.volume == t.volume else None,
+            "open_interest": int(oi) if oi and oi == oi else None,
+            "iv": float(greeks.impliedVol) if greeks and getattr(greeks, 'impliedVol', None) else None,
+            "delta": float(greeks.delta) if greeks and getattr(greeks, 'delta', None) else None,
+            "gamma": float(greeks.gamma) if greeks and getattr(greeks, 'gamma', None) else None,
+            "theta": float(greeks.theta) if greeks and getattr(greeks, 'theta', None) else None,
+            "vega": float(greeks.vega) if greeks and getattr(greeks, 'vega', None) else None,
+        }
+
+    short = leg_data(short_c, short_t)
+    long_ = leg_data(long_c, long_t)
+
+    try:
+        ib.cancelMktData(short_c)
+        ib.cancelMktData(long_c)
+    except Exception:
+        pass
+
+    # Cálculos de spread (asumimos CREDIT spread — short más caro que long)
+    width = abs(long_strike - short_strike)
+    if r == "P":
+        # PCS: short_strike > long_strike
+        net_credit = round(short["bid"] - long_["ask"], 2) if (short["bid"] is not None and long_["ask"] is not None) else None
+    else:
+        # CCS: short_strike < long_strike
+        net_credit = round(short["bid"] - long_["ask"], 2) if (short["bid"] is not None and long_["ask"] is not None) else None
+
+    if net_credit is not None and width > 0:
+        max_loss = round(width * 100 - net_credit * 100, 2)
+        breakeven = round(short_strike - net_credit, 2) if r == "P" else round(short_strike + net_credit, 2)
+        risk_reward = round(net_credit / (width - net_credit), 3) if width > net_credit else None
+    else:
+        max_loss = None
+        breakeven = None
+        risk_reward = None
+
+    # Net debit (lo que pagas para CERRAR ahora): comprar short, vender long
+    net_debit = round(long_["bid"] - short["ask"], 2) if (long_["bid"] is not None and short["ask"] is not None) else None
+    current_pnl_per_contract = None
+    if net_credit is not None and net_debit is not None:
+        current_pnl_per_contract = round((net_credit - net_debit) * 100, 2)
+
+    return {
+        "symbol": sym, "expiry": expiry, "right": r,
+        "short_leg": short,
+        "long_leg": long_,
+        "width": width,
+        "net_credit": net_credit,        # credit recibido al abrir (por contrato, en $)
+        "net_debit": net_debit,          # coste de cerrar ahora
+        "max_loss": max_loss,            # máx pérdida al expiry (en $)
+        "breakeven": breakeven,
+        "risk_reward": risk_reward,      # credit / (width - credit), >0.3 ideal
+        "current_pnl_per_contract": current_pnl_per_contract,
+        "iv_short": short["iv"],
+        "iv_long": long_["iv"],
+        "delta_short": short["delta"],
+        "delta_long": long_["delta"],
+        "net_delta": round((short["delta"] or 0) - (long_["delta"] or 0), 3) if (short["delta"] is not None and long_["delta"] is not None) else None,
+    }
+
+
+def ib_get_metrics_chain(symbol: str, exchange: str = "SMART",
+                         expiry: str = "", lookback_days: int = 252) -> dict:
+    """Resumen agregado de la cadena ATM: IV atm, IV ±5/10, OI/vol ATM, **IV Rank**.
+
+    IV Rank se calcula como ``(IV_atm_actual - IV_atm_min_252d) / (IV_atm_max_252d - IV_atm_min_252d) * 100``.
+    IBKR no expone IV histórica; la aproximación estándar es usar **HV20 rolling** como
+    proxy de IV histórica (el mercado asume que IV ≃ HV en el largo plazo). Se devuelve
+    tanto ``iv_rank_hv_proxy`` (basado en HV20) como ``iv_current`` (IV actual del ATM).
+
+    Args:
+        symbol: subyacente (SPY, NVDA, ...).
+        expiry: YYYYMMDD; si vacío, usa el expiry mensual más cercano.
+        lookback_days: ventana para HV rolling (default 252 = 1 año).
+    """
+    import math
+
+    ib = get_ib()
+    sym = symbol.upper()
+    INDEXES = {"SPX", "NDX", "VIX", "RUT", "SPXW", "NDXW"}
+    if sym in INDEXES:
+        base = Index(sym, "CBOE", "USD")
+        opt_exchange = "CBOE"
+    else:
+        base = Stock(sym, exchange, "USD")
+        opt_exchange = "SMART"
+    ib.qualifyContracts(base)
+    if not base.conId:
+        return {"error": f"No se pudo resolver contrato para {sym}"}
+
+    # Expiries
+    chains = ib.reqSecDefOptParams(base.symbol, '', base.secType, base.conId)
+    if not chains:
+        return {"error": f"No chain para {sym}"}
+    all_expiries = sorted({e for c in chains for e in c.expirations})
+    if not all_expiries:
+        return {"error": "no hay expiries"}
+    if not expiry:
+        # mensual más cercano: el primero con formato YYYYMM... pero IB devuelve YYYYMMDD o YYYYMM
+        # Filtrar los que tienen 6+ dígitos y tomar el primero
+        expiry = all_expiries[0] if len(all_expiries[0]) >= 6 else (all_expiries[0] + "01" if all_expiries else "")
+
+    # Strikes del expiry elegido
+    chain = next((c for c in chains if expiry in c.expirations), None)
+    if not chain:
+        return {"error": f"expiry {expiry} no encontrado en el chain"}
+    strikes = sorted(set(chain.strikes))
+    trading_class = chain.tradingClass
+
+    # Spot
+    spot_t = ib.reqMktData(base, "", False)
+    for _ in range(15):
+        if spot_t.last is not None and not _is_nan(spot_t.last):
+            break
+        ib.sleep(0.1)
+    spot = spot_t.marketPrice() if spot_t.marketPrice() == spot_t.marketPrice() else None
+    if not spot or spot != spot:
+        spot = _clean(spot_t.close) or _clean(spot_t.last)
+    try:
+        ib.cancelMktData(base)
+    except Exception:
+        pass
+    if not spot or spot != spot:
+        # Fallback histórico
+        try:
+            hist = ib.reqHistoricalData(base, '', '1 D', '1 day', 'TRADES', False)
+            spot = hist[-1].close if hist else None
+        except Exception:
+            return {"error": "no se pudo obtener spot"}
+
+    atm_strike = min(strikes, key=lambda s: abs(s - spot))
+    # Solo ATM ±1 strike para mantenerlo ligero; ±10 ya está cubierto por get_option_prices
+    strikes_near = [s for s in strikes if abs(s - atm_strike) <= 1]
+
+    # Subscribir ATM call + put para IV actual
+    def make(strike, right):
+        c = Contract()
+        c.symbol = sym; c.secType = 'OPT'; c.currency = 'USD'
+        c.exchange = opt_exchange; c.lastTradeDateOrContractMonth = expiry
+        c.strike = strike; c.right = right
+        c.tradingClass = trading_class or sym; c.multiplier = '100'
+        return c
+
+    atm_call = make(atm_strike, "C")
+    atm_put = make(atm_strike, "P")
+    ib.qualifyContracts(atm_call, atm_put)
+
+    call_t = ib.reqMktData(atm_call, "101,106,236", False, False)
+    put_t = ib.reqMktData(atm_put, "101,106,236", False, False)
+    for _ in range(25):
+        ok = False
+        for t in (call_t, put_t):
+            if hasattr(t, 'modelGreeks') and t.modelGreeks and t.modelGreeks.impliedVol:
+                ok = True
+        if ok:
+            break
+        ib.sleep(0.2)
+
+    def g(t):
+        if hasattr(t, 'modelGreeks') and t.modelGreeks:
+            return t.modelGreeks
+        return None
+
+    cg = g(call_t); pg = g(put_t)
+    iv_atm_call = cg.impliedVol if cg else None
+    iv_atm_put = pg.impliedVol if pg else None
+    iv_atm_avg = None
+    if iv_atm_call and iv_atm_put:
+        iv_atm_avg = round((iv_atm_call + iv_atm_put) / 2, 4)
+    elif iv_atm_call:
+        iv_atm_avg = round(iv_atm_call, 4)
+    elif iv_atm_put:
+        iv_atm_avg = round(iv_atm_put, 4)
+
+    # OI / vol ATM
+    oi_call = call_t.callOpenInterest if hasattr(call_t, 'callOpenInterest') else None
+    oi_put = put_t.putOpenInterest if hasattr(put_t, 'putOpenInterest') else None
+    vol_call = call_t.volume if hasattr(call_t, 'volume') else None
+    vol_put = put_t.volume if hasattr(put_t, 'volume') else None
+
+    # Total OI/vol ±10
+    near_contracts = []
+    for s in strikes_near:
+        for r in ("C", "P"):
+            near_contracts.append(make(s, r))
+    ib.qualifyContracts(*near_contracts)
+    near_tickers = []
+    for c in near_contracts:
+        if c.conId:
+            nt = ib.reqMktData(c, "101,106,236", False, False)
+            near_tickers.append((c, nt))
+    ib.sleep(2)
+
+    total_oi_near = 0; oi_near_count = 0
+    total_vol_near = 0; vol_near_count = 0
+    for c, t in near_tickers:
+        oi = (t.callOpenInterest if c.right == 'C' else t.putOpenInterest) if hasattr(t, 'callOpenInterest') else None
+        if oi and oi == oi:
+            total_oi_near += oi; oi_near_count += 1
+        if t.volume and t.volume == t.volume:
+            total_vol_near += t.volume; vol_near_count += 1
+        try:
+            ib.cancelMktData(c)
+        except Exception:
+            pass
+    try:
+        ib.cancelMktData(atm_call); ib.cancelMktData(atm_put)
+    except Exception:
+        pass
+
+    # Históricos para IV Rank (HV20 rolling como proxy)
+    bars = []
+    try:
+        bars = ib.reqHistoricalData(base, '', f'{lookback_days} D', '1 day', 'TRADES', False)
+    except Exception:
+        pass
+    closes = [b.close for b in bars if b.close == b.close]
+
+    hv_series = []
+    if len(closes) >= 21:
+        for i in range(20, len(closes)):
+            window = closes[i - 20:i + 1]
+            rets = [math.log(window[j] / window[j - 1]) for j in range(1, len(window))]
+            mean = sum(rets) / len(rets)
+            var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+            hv_series.append(math.sqrt(var) * math.sqrt(252))
+
+    hv20_current = round(hv_series[-1] * 100, 2) if hv_series else None
+    hv_min = round(min(hv_series) * 100, 2) if hv_series else None
+    hv_max = round(max(hv_series) * 100, 2) if hv_series else None
+
+    # IV Rank: si no tenemos IV actual, no se puede calcular
+    iv_rank = None
+    iv_pct = None
+    if iv_atm_avg and hv_min is not None and hv_max and hv_max > hv_min:
+        # usamos HV como proxy de "rango IV histórico"; IV actual en %
+        iv_current_pct = iv_atm_avg * 100
+        iv_rank = round((iv_current_pct - hv_min) / (hv_max - hv_min) * 100, 1)
+        iv_pct = iv_current_pct
+
+    return {
+        "symbol": sym,
+        "expiry": expiry,
+        "spot": round(spot, 2) if spot else None,
+        "atm_strike": atm_strike,
+        "strikes_in_range_pm1": len(strikes_near),
+        "iv_atm_call": round(iv_atm_call, 4) if iv_atm_call else None,
+        "iv_atm_put": round(iv_atm_put, 4) if iv_atm_put else None,
+        "iv_atm_avg": iv_atm_avg,
+        "iv_current_pct": iv_pct,
+        "oi_call_atm": int(oi_call) if oi_call and oi_call == oi_call else None,
+        "oi_put_atm": int(oi_put) if oi_put and oi_put == oi_put else None,
+        "vol_call_atm": int(vol_call) if vol_call and vol_call == vol_call else None,
+        "vol_put_atm": int(vol_put) if vol_put and vol_put == vol_put else None,
+        "total_oi_pm1": total_oi_near,
+        "total_vol_pm1": int(total_vol_near),
+        "hv20_current_pct": hv20_current,
+        "hv_min_252d_pct": hv_min,
+        "hv_max_252d_pct": hv_max,
+        "iv_rank_hv_proxy": iv_rank,   # 0-100 (puede exceder 100 si IV > HV max histórico)
+        "iv_rank_capped": min(iv_rank, 100.0) if iv_rank is not None else None,
+        "lookback_days": lookback_days,
+        "hv_window_days": 20,
+        "note": "iv_rank usa HV20 rolling como proxy de IV histórica (IBKR no expone IV histórica nativa)",
+    }
+
+
 def calculate_spread_strikes(symbol: str, spot: float, offset: float, width: float = 10.0) -> dict:
     """Calcula strikes de venta (PCS) y compra (CCS) para un spread de opciones.
 
@@ -730,6 +1182,27 @@ TOOLS = [
              "right": {"type": "string", "description": "C o P (opcional, todas si se omite)"},
              " ATM_delta": {"type": "number", "description": "Rango de strikes alrededor de ATM (default 10)"}},
              "required": ["symbol", "expiry"]}),
+    Tool(name="get_metrics_underlying", description="Métricas del subyacente: spot, spread, HV20/50, 52w high/low, % off high",
+         inputSchema={"type": "object", "properties": {
+             "symbol": {"type": "string"},
+             "exchange": {"type": "string", "default": "SMART"}},
+             "required": ["symbol"]}),
+    Tool(name="get_metrics_spread", description="Métricas de un spread 2-leg: credit, max loss, breakeven, IV/delta agregados",
+         inputSchema={"type": "object", "properties": {
+             "symbol": {"type": "string"},
+             "expiry": {"type": "string", "description": "YYYYMMDD"},
+             "right": {"type": "string", "enum": ["C", "P"], "description": "C=CCS, P=PCS"},
+             "short_strike": {"type": "number"},
+             "long_strike": {"type": "number"}},
+             "required": ["symbol", "expiry", "right", "short_strike", "long_strike"]}),
+    Tool(name="get_metrics_chain", description="Resumen cadena ATM: IV atm, OI/Vol ATM, IV Rank (proxy HV20)",
+         inputSchema={"type": "object", "properties": {
+             "symbol": {"type": "string"},
+             "exchange": {"type": "string", "default": "SMART"},
+             "expiry": {"type": "string", "description": "YYYYMMDD; si vacío, primer expiry"},
+             "lookback_days": {"type": "integer", "default": 252, "description": "Ventana para HV rolling"}},
+
+             "required": ["symbol"]}),
     Tool(name="submit_option_order", description="Enviar orden de compra/venta de opción (BUY to open / SELL to close)",
          inputSchema={"type": "object", "properties": {
              "action": {"type": "string", "enum": ["BUY", "SELL"], "description": "BUY to open, SELL to close"},
@@ -825,6 +1298,33 @@ async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) ->
             right = arguments.get("right", "")
             delta = arguments.get(" ATM_delta", arguments.get("ATM_delta", 10))
             result = await asyncio.to_thread(_run_ib_sync, ib_get_option_prices, symbol, expiry, right, delta)
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
+
+        elif name == "get_metrics_underlying":
+            symbol = arguments.get("symbol")
+            exchange = arguments.get("exchange", "SMART")
+            result = await asyncio.to_thread(_run_ib_sync, ib_get_metrics_underlying, symbol, exchange)
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
+
+        elif name == "get_metrics_spread":
+            symbol = arguments.get("symbol")
+            expiry = arguments.get("expiry")
+            right = arguments.get("right")
+            short_strike = arguments.get("short_strike")
+            long_strike = arguments.get("long_strike")
+            result = await asyncio.to_thread(
+                _run_ib_sync, ib_get_metrics_spread, symbol, expiry, right, short_strike, long_strike
+            )
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
+
+        elif name == "get_metrics_chain":
+            symbol = arguments.get("symbol")
+            exchange = arguments.get("exchange", "SMART")
+            expiry = arguments.get("expiry", "")
+            lookback_days = arguments.get("lookback_days", 252)
+            result = await asyncio.to_thread(
+                _run_ib_sync, ib_get_metrics_chain, symbol, exchange, expiry, lookback_days
+            )
             return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
 
         elif name == "submit_option_order":
