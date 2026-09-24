@@ -4,11 +4,47 @@ IB Gateway MCP Server - HTTP Streamable transport.
 Uso: IB_MCP_TOKEN=mi-token IB_HOST=127.0.0.1 IB_PORT=4002 python server_http2.py
 """
 import os
+import sys
 import json
+import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
+import threading
+
+# ── Timeout para llamadas IB ──────────────────────────────────────────────────
+def _ib_call(fn, timeout=8, *args, **kwargs):
+    """Ejecuta fn en thread separado con timeout y event loop ib_insync."""
+    result = [None]
+    exc = [None]
+    def target():
+        try:
+            # ib_insync requiere event loop por thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result[0] = fn(*args, **kwargs)
+            finally:
+                loop.close()
+        except Exception as e:
+            exc[0] = e
+    t = threading.Thread(target=target)
+    t.daemon = True
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        raise TimeoutError(f"IB call timed out after {timeout}s")
+    if exc[0]:
+        raise exc[0]
+    return result[0]
+
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+)
+logger = logging.getLogger('ib-mcp')
 
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -24,8 +60,12 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import Tool, TextContent, ListToolsRequest, ListToolsResult, CallToolResult
 from mcp_types import CallToolRequestParams
 
-from ib_insync import IB, Option, Stock, Index, Contract
+from ib_insync import IB, Option, Stock, Index, Contract, Order
 
+# ── Shared combo code from eval/lib ──────────────────────────────────────────
+sys.path.insert(0, '/root/eval/lib')
+from spxw_bag_bracket import place_spxw_bag_bracket
+from conid_cache import get_conid, put_conid
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -82,36 +122,105 @@ def _run_ib_sync(fn, *args, **kwargs):
         if loop is not None:
             loop.close()
 
-_client_counter = [1]
+# ── Thread-local persistent connection ──────────────────────────────────────
+# Cada thread del pool mantiene su propia conexión IB persistente.
+# La conexión se crea al primer uso y se reaprovecha en tool calls posteriores.
+# Si la conexión se cae, se reconecta automáticamente.
+
+_thread_local = threading.local()
+
+_client_counter = [10]  # counter para clientId
 _client_lock = threading.Lock()
 
-def get_ib(client_id: Optional[int] = None) -> IB:
+
+def _next_client_id():
+    _client_counter[0] += 1
+    return _client_counter[0]
+
+
+def _get_thread_ib() -> IB:
+    """
+    Retorna la conexión IB persistente para el thread actual.
+    - Si existe y está conectada → la reusa.
+    - Si existe pero está desconectada → reconecta con el mismo clientId.
+    - Si no existe → crea nueva conexión y registra callbacks.
+    """
+    ib = getattr(_thread_local, 'ib', None)
+    client_id = getattr(_thread_local, 'client_id', None)
+
+    if ib is not None and ib.isConnected():
+        return ib
+
+    # Reconectar o crear nueva
+    if ib is not None:
+        logger.info(f"Reconectando thread ib (clientId={client_id})...")
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+
+    # Nuevo clientId si no tenemos uno
     if client_id is None:
         with _client_lock:
             client_id = _client_counter[0]
             _client_counter[0] += 1
+
     ib = IB()
-    ib.connect(HOST, PORT, clientId=client_id, timeout=10)
+    ib.connect(HOST, PORT, clientId=client_id, timeout=30)
+    _thread_local.ib = ib
+    _thread_local.client_id = client_id
+
+    # Registrar callback de errores
+    ib.errorEvent += _on_ib_error
+
+    logger.info(f"✅ Thread ib conectado (clientId={client_id})")
     return ib
+
+
+def _reset_thread_ib():
+    """Forzar desconexión para el thread actual (próximo uso reconnectará)."""
+    ib = getattr(_thread_local, 'ib', None)
+    if ib is not None:
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        _thread_local.ib = None
+        _thread_local.client_id = None
+
+
+def _on_ib_error(reqId, errorCode, errorString, contract):
+    logger.warning(f"⚠️ IB error {errorCode}: {errorString} (reqId={reqId})")
+
+
+def get_ib(client_id: Optional[int] = None) -> IB:
+    """
+    Legacy: retorna conexión persistente para el thread actual.
+    El parámetro client_id se ignora — cada thread tiene su propia conexión.
+    """
+    return _get_thread_ib()
 
 
 def ib_get_status() -> dict:
     ib = get_ib()
     connected = ib.isConnected()
-    ib.disconnect()
     return {"connected": connected}
 
 
 def ib_get_account() -> dict:
+    """Snapshot de valores clave de cuenta — usa ``ib.accountValues()`` que ya viene
+    pre-poblado tras la conexión. Si está vacío (conexión muy reciente) lanza
+    ``ConnectionError`` para que el caller haga fallback."""
     ib = get_ib()
-    accts = ib.accountSummary()
-    ib.disconnect()
+    wanted = {'NetLiquidation', 'CashBalance', 'BuyingPower',
+              'EquityWithLoanValue', 'FullMaintMarginReq',
+              'AvailableFunds', 'ExcessLiquidity'}
     data = {}
-    for a in accts:
-        if a.tag in ('NetLiquidation', 'CashBalance', 'BuyingPower',
-                     'EquityWithLoanValue', 'FullMaintMarginReq',
-                     'AvailableFunds', 'ExcessLiquidity'):
-            data[f"{a.tag}_{a.currency}"] = {"value": a.value, "currency": a.currency}
+    for v in ib.accountValues():
+        if v.tag in wanted:
+            data[f"{v.tag}_{v.currency}"] = {"value": v.value, "currency": v.currency}
+    if not data:
+        raise ConnectionError("accountValues empty — connection too fresh, retry once")
     return data
 
 
@@ -119,7 +228,6 @@ def ib_get_positions() -> list:
     ib = get_ib()
     positions = ib.positions()
     pnl_map = {pn.contract: pn.unrealizedPnL for pn in ib.pnl()}
-    ib.disconnect()
     if not positions:
         return []
     return [
@@ -133,25 +241,39 @@ def ib_get_positions() -> list:
 def ib_get_pnl() -> list:
     ib = get_ib()
     pnl_list = ib.pnl()
-    ib.disconnect()
     return [
         {"account": pn.account, "dailyPnL": round(pn.dailyPnL or 0, 2),
-         "unrealizedPnL": round(pn.unrealizedPnL or 0, 2),
+         "unrealizedPnl": round(pn.unrealizedPnL or 0, 2),
          "symbol": fmt_contract(pn.contract)["symbol"]}
         for pn in pnl_list
     ]
 
 
 def ib_get_market_data(symbol: str, exchange: str = "SMART") -> dict:
+    """Snapshot de bid/ask/last/close. Streaming + wait corto; el ticker queda vivo
+    para reuso pero se cancela explícitamente al final para evitar acumulación."""
     ib = get_ib()
     contract = Stock(symbol, exchange, "USD")
     ib.qualifyContracts(contract)
     ticker = ib.reqMktData(contract, "", False)
-    ib.sleep(1.5)
-    data = {"symbol": symbol, "bid": ticker.bid, "ask": ticker.ask,
-            "last": ticker.last, "close": ticker.close, "volume": ticker.volume}
-    ib.disconnect()
+    # Esperar hasta 3s para que llegue un tick con datos reales (no NaN)
+    for _ in range(30):
+        if (ticker.bid is not None and not _is_nan(ticker.bid)) or \
+           (ticker.last is not None and not _is_nan(ticker.last)):
+            break
+        ib.sleep(0.1)
+    data = {"symbol": symbol, "bid": _clean(ticker.bid), "ask": _clean(ticker.ask),
+            "last": _clean(ticker.last), "close": _clean(ticker.close),
+            "volume": _clean(ticker.volume)}
     return data
+
+
+def _is_nan(x):
+    return x is None or (isinstance(x, float) and x != x)
+
+
+def _clean(x):
+    return None if _is_nan(x) else x
 
 
 def ib_get_option_chain(symbol: str, expiry: str = "") -> list | list[str]:
@@ -170,7 +292,6 @@ def ib_get_option_chain(symbol: str, expiry: str = "") -> list | list[str]:
     opt_chains = ib.reqSecDefOptParams(base.symbol, '', base.secType, base.conId)
 
     if not opt_chains:
-        ib.disconnect()
         return []
 
     if expiry:
@@ -199,27 +320,18 @@ def ib_get_option_chain(symbol: str, expiry: str = "") -> list | list[str]:
             if key not in seen:
                 seen.add(key)
                 result.append(c)
-        ib.disconnect()
         return sorted(result, key=lambda x: x["strike"])
     else:
         # Todos los vencimientos disponibles
         expirations = set()
         for chain in opt_chains:
             expirations.update(chain.expirations)
-        ib.disconnect()
         return sorted(expirations)
 
 
-_client_counter = [10]  # counter para clientId
-
-def _next_client_id():
-    _client_counter[0] += 1
-    return _client_counter[0]
-
-
-def ib_get_option_prices(symbol: str, expiry: str, right: str = "", ATM_delta: int = 10) -> list:
+def ib_get_option_prices(symbol: str, expiry: str, right: str = "", ATM_delta: int = 10) -> dict:
     """Precios bid/ask de opciones para strikes ATM +- delta."""
-    ib = get_ib(client_id=_next_client_id())
+    ib = get_ib()
 
     INDEXES = {"SPX", "NDX", "VIX", "RUT", "SPXW", "NDXW"}
     if symbol.upper() in INDEXES:
@@ -256,8 +368,7 @@ def ib_get_option_prices(symbol: str, expiry: str, right: str = "", ATM_delta: i
             break
 
     if not all_strikes:
-        ib.disconnect()
-        return [{"error": f"No strikes found for {symbol} {expiry}"}]
+        return {"error": f"No strikes found for {symbol} {expiry}"}
 
     all_strikes = sorted(set(all_strikes))
 
@@ -326,8 +437,257 @@ def ib_get_option_prices(symbol: str, expiry: str, right: str = "", ATM_delta: i
             "vega": float(greeks.vega) if hasattr(greeks, 'vega') and greeks.vega else None,
         })
 
-    ib.disconnect()
     return {"spot": spot_used, "atm_strike": atm_strike, "options": result}
+
+
+def calculate_spread_strikes(symbol: str, spot: float, offset: float, width: float = 10.0) -> dict:
+    """Calcula strikes de venta (PCS) y compra (CCS) para un spread de opciones.
+
+    PCS (Put Credit Spread): vender PUT ATM-offset, comprar PUT ATM-offset-width
+    CCS (Call Credit Spread): vender CALL ATM+offset, comprar CALL ATM+offset+width
+
+    Returns: {"sell_strike": ..., "buy_strike": ..., "net_credit_max": ...}
+    """
+    ib = get_ib()
+
+    INDEXES = {"SPX", "NDX", "VIX", "RUT", "SPXW", "NDXW"}
+    if symbol.upper() in INDEXES:
+        base = Index(symbol.upper(), "CBOE", "USD")
+    else:
+        base = Stock(symbol.upper(), "SMART", "USD")
+
+    ib.qualifyContracts(base)
+
+    # Obtener strikes disponibles alrededor del spot
+    chains = ib.reqSecDefOptParams(base.symbol, '', base.secType, base.conId)
+
+    all_strikes = []
+    trading_class = None
+    for chain in chains:
+        all_strikes.extend(chain.strikes)
+        trading_class = chain.tradingClass
+        break
+
+    if not all_strikes:
+        return {"error": f"No strikes found for {symbol}"}
+
+    all_strikes = sorted(set(all_strikes))
+
+    # Encontrar el strike más cercano al spot (ATM)
+    atm_strike = min(all_strikes, key=lambda s: abs(s - spot))
+
+    # Strike de venta: el strike disponible más cercano al spot - offset
+    sell_target = spot - offset
+    sell_strike = min(all_strikes, key=lambda s: abs(s - sell_target))
+
+    # Strike de compra: sell_strike - width (para PCS) o sell_strike + width (para CCS)
+    # Por defecto calculamos PCS: vender put strike más bajo, comprar put strike más alto
+    buy_strike = sell_strike + width
+
+    return {
+        "symbol": symbol.upper(),
+        "spot": spot,
+        "offset": offset,
+        "width": width,
+        "atm_strike": atm_strike,
+        "sell_strike": sell_strike,
+        "buy_strike": buy_strike,
+        "spread_type": "PCS",  # Put Credit Spread
+        "risk": width * 100,  # riesgo máximo por contrato en USD
+        "trading_class": trading_class,
+    }
+
+
+def ib_combo_quote(short_strike: float, long_strike: float,
+                    right: str, expiry: str) -> dict:
+    """Obtiene bid/ask mid de ambos legs de un spread."""
+    ib = get_ib()
+    SYMBOL, EXCHANGE_OPT, TRADING_CLASS = 'SPX', 'CBOE', 'SPXW'
+
+    def _opt(strike):
+        c = Contract(secType='OPT', symbol=SYMBOL, exchange=EXCHANGE_OPT,
+                     right=right, strike=float(strike),
+                     lastTradeDateOrContractMonth=expiry,
+                     currency='USD', multiplier='100', tradingClass=TRADING_CLASS)
+        ib.qualifyContracts(c)
+        return c
+
+    short_opt = _opt(short_strike)
+    long_opt  = _opt(long_strike)
+
+    ts = ib.reqMktData(short_opt, '', False, False)
+    tl = ib.reqMktData(long_opt,  '', False, False)
+    for _ in range(10):
+        ib.sleep(0.3)
+        if ts.bid > 0 and tl.bid > 0:
+            break
+
+    ib.cancelMktData(short_opt)
+    ib.cancelMktData(long_opt)
+
+    s_bid, s_ask = ts.bid, ts.ask
+    l_bid, l_ask = tl.bid, tl.ask
+    credit_mid = None
+    if all(x == x for x in [s_bid, s_ask, l_bid, l_ask]):
+        credit_mid = round((s_bid + s_ask) / 2 - (l_bid + l_ask) / 2, 4)
+
+    return {
+        "short_bid": s_bid, "short_ask": s_ask,
+        "long_bid":  l_bid,  "long_ask":  l_ask,
+        "credit_mid": credit_mid,
+        "short_strike": short_strike, "long_strike": long_strike,
+        "right": right, "expiry": expiry,
+    }
+
+
+def ib_submit_combo(short_strike: float, long_strike: float,
+                    right: str, expiry: str,
+                    credit_est: Optional[float],
+                    order_ref: str, qty: int) -> dict:
+    """Coloca un BAG combo spread (2-leg PCS/CCS) con bracket TP/SL."""
+    ib = get_ib()
+    result = place_spxw_bag_bracket(
+        ib=ib,
+        short_strike=float(short_strike),
+        long_strike=float(long_strike),
+        expiry=expiry,
+        right=right,
+        credit_est=float(credit_est) if credit_est else None,
+        order_ref=order_ref,
+        oca_prefix=f"OCA_{order_ref}",
+        qty=qty,
+    )
+    return {
+        "status":      result.get("status"),
+        "credit_real": result.get("credit_real"),
+        "credit_mid":  result.get("credit_mid"),
+        "limit_price": result.get("limit_price"),
+        "tp_price":    result.get("tp_price"),
+        "sl_trigger":  result.get("sl_trigger"),
+        "trade_ids":   result.get("trade_ids", []),
+    }
+
+
+def submit_option_order(action: str, symbol: str, expiry: str, strike: float,
+                        right: str, quantity: int, orderType: str = "LIMIT",
+                        price: float = None, tif: str = "DAY") -> dict:
+    """Enviar una orden de opción (BUY to open / SELL to close)."""
+    ib = get_ib()
+    client_id = _next_client_id()
+
+    # Construir el contrato de opción
+    c = Contract()
+    c.symbol = symbol.upper()
+    c.secType = 'OPT'
+    c.currency = 'USD'
+    c.exchange = 'CBOE' if symbol.upper() in {"SPX", "NDX", "VIX", "RUT", "SPXW", "NDXW"} else 'SMART'
+    c.lastTradeDateOrContractMonth = expiry
+    c.strike = strike
+    c.right = right.upper()
+    c.tradingClass = symbol.upper()
+    c.multiplier = '100'
+
+    ib.qualifyContracts(c)
+
+    if not c.conId:
+        return {"error": f"Contract not qualified: {symbol} {right} {strike} {expiry}"}
+
+    # Construir la orden
+    order = Order()
+    order.action = action.upper()
+    order.orderType = orderType.upper()
+    order.totalQuantity = quantity
+    if orderType.upper() == "LIMIT" and price is not None:
+        order.lmtPrice = price
+    elif orderType.upper() == "MKT":
+        pass  # orden al mercado, no necesita precio
+    order.tif = tif.upper()
+    order.transmit = True
+    order.clientId = client_id
+
+    # Enviar la orden
+    trade = ib.placeOrder(c, order)
+
+    # Esperar confirmación
+    ib.sleep(2)
+
+    return {
+        "status": "sent" if trade.isDone else "pending",
+        "clientOrderId": str(order.clientId),
+        "orderId": trade.orderId,
+        "action": order.action,
+        "symbol": symbol.upper(),
+        "expiry": expiry,
+        "strike": strike,
+        "right": right.upper(),
+        "quantity": quantity,
+        "orderType": order.orderType,
+        "price": order.lmtPrice if hasattr(order, 'lmtPrice') else None,
+        "tif": order.tif,
+        "contract": fmt_contract(c),
+    }
+
+
+def cancel_order(clientOrderId: str) -> dict:
+    """Cancelar una orden por clientOrderId."""
+    ib = get_ib()
+
+    try:
+        client_id = int(clientOrderId)
+    except ValueError:
+        return {"error": f"Invalid clientOrderId: {clientOrderId}"}
+
+    # Buscar la orden
+    orders = ib.openOrders()
+    target_order = None
+    for o in orders:
+        if o.clientId == client_id:
+            target_order = o
+            break
+
+    if target_order is None:
+        return {"error": f"Order not found with clientOrderId: {clientOrderId}"}
+
+    # Cancelar
+    ib.cancelOrder(target_order)
+
+    ib.sleep(1)
+
+    return {
+        "status": "cancelled",
+        "clientOrderId": clientOrderId,
+        "orderId": target_order.orderId,
+        "action": target_order.action,
+        "symbol": target_order.contract.symbol if target_order.contract else "unknown",
+    }
+
+
+def get_open_orders(symbol: str = None) -> list:
+    """Lista órdenes pendientes o en ejecución."""
+    ib = get_ib()
+
+    orders = ib.openOrders()
+    if not orders:
+        return []
+
+    result = []
+    for o in orders:
+        if symbol and o.contract and o.contract.symbol != symbol.upper():
+            continue
+        result.append({
+            "orderId": o.orderId,
+            "clientOrderId": o.clientId,
+            "action": o.action,
+            "orderType": o.orderType,
+            "totalQuantity": o.totalQuantity,
+            "lmtPrice": o.lmtPrice,
+            "status": o.status,
+            "tif": o.tif,
+            "contract": fmt_contract(o.contract) if o.contract else {},
+            "remaining": o.totalQuantity - (o.filledCount or 0),
+        })
+
+    return result
 
 
 def fmt_contract(c):
@@ -356,17 +716,64 @@ TOOLS = [
     Tool(name="get_market_data", description="Bid/ask/last de un ticker",
          inputSchema={"type": "object", "properties": {
              "symbol": {"type": "string"},
-             "exchange": {"type": "string", "default": "SMART"}},"required": ["symbol"]}),
+             "exchange": {"type": "string", "default": "SMART"}},
+             "required": ["symbol"]}),
     Tool(name="get_option_chain", description="Cadena de opciones (expirations o strikes por expiry)",
          inputSchema={"type": "object", "properties": {
              "symbol": {"type": "string"},
-             "expiry": {"type": "string"}},"required": ["symbol"]}),
+             "expiry": {"type": "string"}},
+             "required": ["symbol"]}),
     Tool(name="get_option_prices", description="Precios bid/ask de opciones para strikes ATM",
          inputSchema={"type": "object", "properties": {
              "symbol": {"type": "string"},
              "expiry": {"type": "string"},
              "right": {"type": "string", "description": "C o P (opcional, todas si se omite)"},
-             " ATM_delta": {"type": "number", "description": "Rango de strikes alrededor de ATM (default 10)"}},"required": ["symbol", "expiry"]}),
+             " ATM_delta": {"type": "number", "description": "Rango de strikes alrededor de ATM (default 10)"}},
+             "required": ["symbol", "expiry"]}),
+    Tool(name="submit_option_order", description="Enviar orden de compra/venta de opción (BUY to open / SELL to close)",
+         inputSchema={"type": "object", "properties": {
+             "action": {"type": "string", "enum": ["BUY", "SELL"], "description": "BUY to open, SELL to close"},
+             "symbol": {"type": "string"},
+             "expiry": {"type": "string"},
+             "strike": {"type": "number"},
+             "right": {"type": "string", "enum": ["C", "P"]},
+             "quantity": {"type": "integer", "description": "Número de contratos"},
+             "orderType": {"type": "string", "enum": ["LIMIT", "MKT"], "default": "LIMIT"},
+             "price": {"type": "number", "description": "Precio límite (solo LIMIT)"},
+             "tif": {"type": "string", "enum": ["DAY", "GTC", "IOC", "FOK"], "default": "DAY"}},
+             "required": ["action", "symbol", "expiry", "strike", "right", "quantity"]}),
+    Tool(name="cancel_order", description="Cancelar una orden abierta por clientOrderId",
+         inputSchema={"type": "object", "properties": {
+             "clientOrderId": {"type": "string"}},
+             "required": ["clientOrderId"]}),
+    Tool(name="get_open_orders", description="Lista órdenes pendientes o en ejecución (con filtro opcional por symbol)",
+         inputSchema={"type": "object", "properties": {
+             "symbol": {"type": "string", "description": "Filtrar por symbol (opcional)"}},
+             "required": []}),
+    Tool(name="calculate_spread_strikes", description="Calcula strikes de venta y compra para un spread PCS/CCS dado el spot y el offset",
+         inputSchema={"type": "object", "properties": {
+             "symbol": {"type": "string"},
+             "spot": {"type": "number"},
+             "offset": {"type": "number", "description": "Puntos de offset desde el spot para el strike de venta"},
+             "width": {"type": "number", "description": "Ancho del spread en puntos (default 10)"}},
+             "required": ["symbol", "spot", "offset"]}),
+    Tool(name="combo_quote", description="Obtiene bid/ask mid de ambos legs de un spread para calcular crédito — sin colocar orden",
+         inputSchema={"type": "object", "properties": {
+             "short_strike": {"type": "number"},
+             "long_strike":  {"type": "number"},
+             "right":        {"type": "string", "enum": ["P", "C"]},
+             "expiry":       {"type": "string", "description": "YYYYMMDD"}},
+             "required": ["short_strike", "long_strike", "right", "expiry"]}),
+    Tool(name="submit_combo_order", description="Coloca un BAG combo spread (2-leg) — PCS o CCS",
+         inputSchema={"type": "object", "properties": {
+             "short_strike": {"type": "number"},
+             "long_strike":  {"type": "number"},
+             "right":        {"type": "string", "enum": ["P", "C"]},
+             "expiry":       {"type": "string", "description": "YYYYMMDD"},
+             "credit_est":   {"type": "number", "description": "Crédito estimado (opcional — obtiene mid de mercado si se omite)"},
+             "order_ref":    {"type": "string", "description": "Tag para identificar la orden en TWS (default DASHCOMBO)"},
+             "qty":          {"type": "integer", "description": "Contratos (default 1)"}},
+             "required": ["short_strike", "long_strike", "right", "expiry"]}),
 ]
 
 
@@ -416,9 +823,69 @@ async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) ->
             symbol = arguments.get("symbol")
             expiry = arguments.get("expiry")
             right = arguments.get("right", "")
-            delta = arguments.get("ATM_delta", 10)
+            delta = arguments.get(" ATM_delta", arguments.get("ATM_delta", 10))
             result = await asyncio.to_thread(_run_ib_sync, ib_get_option_prices, symbol, expiry, right, delta)
             return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
+
+        elif name == "submit_option_order":
+            action = arguments.get("action")
+            symbol = arguments.get("symbol")
+            expiry = arguments.get("expiry")
+            strike = arguments.get("strike")
+            right = arguments.get("right")
+            quantity = arguments.get("quantity")
+            orderType = arguments.get("orderType", "LIMIT")
+            price = arguments.get("price")
+            tif = arguments.get("tif", "DAY")
+            result = await asyncio.to_thread(
+                _run_ib_sync, submit_option_order,
+                action, symbol, expiry, strike, right, quantity, orderType, price, tif
+            )
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
+
+        elif name == "cancel_order":
+            clientOrderId = arguments.get("clientOrderId")
+            result = await asyncio.to_thread(_run_ib_sync, cancel_order, clientOrderId)
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
+
+        elif name == "get_open_orders":
+            symbol = arguments.get("symbol")
+            result = await asyncio.to_thread(_run_ib_sync, get_open_orders, symbol)
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
+
+        elif name == "calculate_spread_strikes":
+            symbol = arguments.get("symbol")
+            spot = arguments.get("spot")
+            offset = arguments.get("offset")
+            width = arguments.get("width", 10)
+            result = await asyncio.to_thread(
+                _run_ib_sync, calculate_spread_strikes, symbol, spot, offset, width
+            )
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, indent=2))])
+
+        elif name == "combo_quote":
+            short_strike = float(arguments["short_strike"])
+            long_strike  = float(arguments["long_strike"])
+            right        = arguments["right"]
+            expiry       = arguments["expiry"]
+            result = await asyncio.to_thread(
+                _run_ib_sync, ib_combo_quote, short_strike, long_strike, right, expiry
+            )
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result))])
+
+        elif name == "submit_combo_order":
+            short_strike = float(arguments["short_strike"])
+            long_strike  = float(arguments["long_strike"])
+            right        = arguments["right"]
+            expiry       = arguments["expiry"]
+            credit_est   = arguments.get("credit_est")
+            order_ref    = arguments.get("order_ref", "DASHCOMBO")
+            qty          = int(arguments.get("qty", 1))
+            result = await asyncio.to_thread(
+                _run_ib_sync, ib_submit_combo, short_strike, long_strike, right, expiry,
+                credit_est, order_ref, qty
+            )
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(result))])
 
         else:
             return CallToolResult(content=[TextContent(type="text", text=f"Unknown tool: {name}")], isError=True)
@@ -473,32 +940,81 @@ def _ib_account():
 def _ib_positions():
     return ib_get_positions()
 
+def _ib_combo_quote(short_strike: float, long_strike: float, right: str, expiry: str):
+    return ib_combo_quote(short_strike, long_strike, right, expiry)
+
+def _ib_submit_combo(short_strike: float, long_strike: float, right: str, expiry: str,
+                     credit_est, order_ref: str, qty: int):
+    return ib_submit_combo(short_strike, long_strike, right, expiry, credit_est, order_ref, qty)
+
 from starlette.responses import JSONResponse
 
 async def rest_status(request: Request) -> JSONResponse:
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _run_ib_sync, _ib_status)
+        result = await asyncio.get_event_loop().run_in_executor(None, _ib_call, _ib_status, 8)
         return JSONResponse({**result, "time": datetime.now().isoformat()})
+    except TimeoutError as e:
+        return JSONResponse({"connected": False, "error": str(e)}, status_code=503)
     except Exception as e:
         return JSONResponse({"connected": False, "error": str(e)}, status_code=503)
 
 async def rest_account(request: Request) -> JSONResponse:
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _run_ib_sync, _ib_account)
+        result = await asyncio.get_event_loop().run_in_executor(None, _ib_call, _ib_account, 8)
         return JSONResponse(result)
+    except TimeoutError as e:
+        return JSONResponse({"error": f"timeout: {e}"}, status_code=503)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 async def rest_positions(request: Request) -> JSONResponse:
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _run_ib_sync, _ib_positions)
+        result = await asyncio.get_event_loop().run_in_executor(None, _ib_call, _ib_positions, 8)
         return JSONResponse(result)
+    except TimeoutError as e:
+        return JSONResponse({"error": f"timeout: {e}"}, status_code=503)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 mcp_app.add_route("/api/status", route=rest_status, methods=["GET"])
 mcp_app.add_route("/api/account", route=rest_account, methods=["GET"])
 mcp_app.add_route("/api/positions", route=rest_positions, methods=["GET"])
+
+
+async def rest_combo_quote(request: Request) -> JSONResponse:
+    try:
+        data = await request.json()
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, _ib_call, _ib_combo_quote, 15,
+            float(data["short_strike"]), float(data["long_strike"]),
+            data["right"], data["expiry"]
+        )
+        return JSONResponse(result)
+    except TimeoutError as e:
+        return JSONResponse({"error": f"timeout: {e}"}, status_code=503)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def rest_combo_submit(request: Request) -> JSONResponse:
+    try:
+        data = await request.json()
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, _ib_call, _ib_submit_combo, 20,
+            float(data["short_strike"]), float(data["long_strike"]),
+            data["right"], data["expiry"],
+            data.get("credit_est"), data.get("order_ref", "DASHCOMBO"),
+            int(data.get("qty", 1))
+        )
+        return JSONResponse(result)
+    except TimeoutError as e:
+        return JSONResponse({"error": f"timeout: {e}"}, status_code=503)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+mcp_app.add_route("/api/combo/quote",   route=rest_combo_quote,   methods=["POST"])
+mcp_app.add_route("/api/combo/submit",  route=rest_combo_submit,  methods=["POST"])
 
 app = mcp_app
 
